@@ -1,6 +1,6 @@
 # ComfyUI Qwen Image Mixed Precision for NVIDIA Tesla V100 (Volta / sm_70)
 
-**Run Qwen Image faster on an NVIDIA Tesla V100 32GB in ComfyUI.** This custom node adds a V100-specific mixed-precision execution path for **Qwen Image / Qwen Rapid**, using FP16 Tensor Core inputs for large GEMMs while keeping FP32 output and numerically sensitive paths where needed.
+**Run Qwen Image faster on an NVIDIA Tesla V100 32GB in ComfyUI.** This custom node adds a V100-specific mixed-precision execution path for **Qwen Image / Qwen Rapid and Qwen Image 2.1**, using FP16 Tensor Core inputs for large GEMMs while keeping FP32 output and numerically sensitive paths where needed.
 
 On the tested **Tesla V100 32GB** Qwen Rapid workflow, sampling improved from **91.378s to 63.923s** over 5 steps: **1.43x faster sampling** and about **30% lower total latency**, with zero NaN/Inf values and no obvious visual artifacts.
 
@@ -23,6 +23,18 @@ On the tested **Tesla V100 32GB** Qwen Rapid workflow, sampling improved from **
 **Result: 1.42x faster total time, 1.43x faster sampling, and 29.8% lower total latency.**
 
 The first run was excluded as warmup. The custom node and workflow were unchanged between measured runs. These numbers are from this specific workflow and environment and are not intended as a cross-GPU benchmark.
+
+## Benchmark: Tesla V100 32GB + Qwen Image 2.1
+
+Full-size Qwen Image 2.1 transformer with random weights, 1024x1024, one denoising step:
+
+| Compute | Step time | Error vs FP32 |
+| --- | ---: | ---: |
+| FP32 (ComfyUI default on V100) | 5468 ms | — |
+| Pure FP16 | 1170 ms | 0.57% |
+| V100 Mixed Precision | **1874 ms** | **0.35%** |
+
+**Result: 2.9x faster than the FP32 default.** When the residual stream exceeds the FP16 range, pure FP16 output breaks (141% error in a forced-overflow test) while the mixed path stays at 0.19%. Not yet measured with real 2.1 weights.
 
 ## Who is this for?
 
@@ -54,10 +66,10 @@ The goal is not generic automatic mixed precision. It is a deliberately narrow o
 
 - NVIDIA Tesla V100 / compute capability 7.0 (`sm_70`)
 - Tested on Tesla V100 32GB
-- ComfyUI with a Qwen Image model
+- ComfyUI with Qwen Image 2.1 support and a Qwen Image or Qwen Image 2.1 model
 - PyTorch build where `torch.mm(fp16, fp16, out_dtype=torch.float32)` works
 
-The node rejects non-`sm_70` GPUs and non-Qwen Image diffusion models.
+The node rejects non-`sm_70` GPUs and other diffusion models.
 
 ## Installation
 
@@ -86,7 +98,7 @@ Do **not** also add a separate `ModelComputeDtype fp16` node. This node sets the
 
 ### Inputs
 
-- `model`: Qwen Image `MODEL` connection.
+- `model`: Qwen Image or Qwen Image 2.1 `MODEL` connection.
 - `enabled=true`: apply the V100 mixed-precision patch.
 - `enabled=false`: pass the original model through unchanged.
 - `validate_numerics=false`: normal generation mode.
@@ -126,4 +138,4 @@ This project is intentionally specialized for **NVIDIA Tesla V100, Volta, sm_70,
 
 ## Search keywords
 
-NVIDIA Tesla V100, V100 32GB, Volta, sm_70, CUDA compute capability 7.0, ComfyUI V100, Qwen Image V100, Qwen Rapid V100, Qwen Image ComfyUI, mixed precision, FP16 Tensor Core, FP32, PyTorch, generative AI.
+NVIDIA Tesla V100, V100 32GB, Volta, sm_70, CUDA compute capability 7.0, ComfyUI V100, Qwen Image V100, Qwen Image 2.1 V100, Qwen Rapid V100, Qwen Image ComfyUI, mixed precision, FP16 Tensor Core, FP32, PyTorch, generative AI.

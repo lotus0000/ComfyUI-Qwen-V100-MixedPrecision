@@ -5,7 +5,9 @@ import torch
 import torch.nn.functional as F
 
 import comfy.ops
+import comfy.quant_ops
 from comfy.ldm.flux.math import apply_rope1
+from comfy.ldm.qwen_image21.model import _gated_residual, _modulated_norm
 from comfy.ldm.modules.attention import optimized_attention_masked
 
 
@@ -153,6 +155,75 @@ def _mixed_block(self, hidden_states, encoder_hidden_states, encoder_hidden_stat
     return encoder_hidden_states, hidden_states
 
 
+def _mixed_swiglu(mlp, x, options):
+    if mlp.fused:
+        gate, up = _fp16_linear_fp32(mlp.gate_up, x).chunk(2, dim=-1)
+    else:
+        gate, up = _fp16_linear_fp32(mlp.gate_layer, x), _fp16_linear_fp32(mlp.proj, x)
+    _check(options, "image_mlp.up_proj", gate, up)
+    x = F.silu(gate).mul_(up)
+    _check(options, "image_mlp.swiglu", x)
+    x = _fp16_linear_fp32(mlp.out, x)
+    _check(options, "image_mlp.down_proj", x)
+    return x
+
+
+def _mixed_attention21(self, x, pe, attn_fn, prefix_len, transformer_options={}):
+    B, N, _ = x.shape
+    x = x.to(torch.float16)
+    q = _fp16_linear_fp32(self.to_q, x).view(B, N, self.heads, -1)
+    k = _fp16_linear_fp32(self.to_k, x).view(B, N, self.heads, -1)
+    v = _fp16_linear_fp32(self.to_v, x).view(B, N, self.heads, -1)
+    _check(transformer_options, "attention.qkv_proj", q, k, v)
+    patches = transformer_options.get("patches", {}).get("attn1_patch", [])
+    if patches:
+        q, k = self.norm_q(q), self.norm_k(k)
+        q, k, v, pe = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), pe.transpose(1, 2)
+        extra_options = {**transformer_options, "img_slice": [prefix_len, N]}
+        for p in patches:
+            out = p(q, k, v, pe=pe, attn_mask=None, extra_options=extra_options)
+            q, k, v, pe = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe)
+        q, k, v, pe = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous(), pe.transpose(1, 2).contiguous()
+        q = apply_rope1(q, pe)
+        k = apply_rope1(k, pe)
+    else:
+        q_scale, _, q_stream = comfy.ops.cast_bias_weight(self.norm_q, q, offloadable=True)
+        k_scale, _, k_stream = comfy.ops.cast_bias_weight(self.norm_k, k, offloadable=True)
+        q, k = comfy.quant_ops.ck.rms_rope(q, k, pe, q_scale, k_scale, self.norm_q.eps)
+        comfy.ops.uncast_bias_weight(self.norm_q, q_scale, None, q_stream)
+        comfy.ops.uncast_bias_weight(self.norm_k, k_scale, None, k_stream)
+    _check(transformer_options, "attention.qk_norm_rope", q, k)
+    out = attn_fn(q, k, v, self.heads, preferred_attention=self.comfy_attention)
+    _check(transformer_options, "attention.softmax_value", out)
+    out = _fp16_linear_fp32(self.to_out[0], out)
+    _check(transformer_options, "attention.output_proj", out)
+    return out
+
+
+def _mixed_block21(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
+    begin = transformer_options.get("qwen_v100_begin")
+    if begin is not None:
+        begin(self)
+    x = x.float()
+    scale1, gate1, scale2, gate2 = [(prefix.float(), target.float()) for prefix, target in mod[:4]]
+    zero = mod[4].float()
+    x = _gated_residual(x, self.attn(_modulated_norm(self.img_norm1, x, scale1, prefix_len, zero), pe, attn_fn, prefix_len, transformer_options), gate1, prefix_len)
+    _check(transformer_options, "attention.residual", x)
+    x = _gated_residual(x, _mixed_swiglu(self.img_mlp, _modulated_norm(self.img_norm2, x, scale2, prefix_len, zero), transformer_options), gate2, prefix_len)
+    _check(transformer_options, "image_mlp.residual", x)
+
+    validator = transformer_options.get("qwen_v100_validator")
+    if validator is not None:
+        validator(self, x)
+    return x
+
+
+MIXED_FORWARDS = {
+    "QwenImageTransformer2DModel": (_mixed_block, _mixed_attention),
+    "QwenImage21Transformer2DModel": (_mixed_block21, _mixed_attention21),
+}
+
+
 class QwenV100MixedPrecision:
     @classmethod
     def INPUT_TYPES(cls):
@@ -174,18 +245,19 @@ class QwenV100MixedPrecision:
 
         patched = model.clone()
         diffusion_model = patched.model.diffusion_model
-        if diffusion_model.__class__.__name__ != "QwenImageTransformer2DModel":
-            raise RuntimeError("Qwen V100 Mixed Precision only supports Qwen Image models")
+        if diffusion_model.__class__.__name__ not in MIXED_FORWARDS:
+            raise RuntimeError("Qwen V100 Mixed Precision only supports Qwen Image and Qwen Image 2.1 models")
+        block_forward, attention_forward = MIXED_FORWARDS[diffusion_model.__class__.__name__]
 
         patched.set_model_compute_dtype(torch.float16)
         for index, block in enumerate(diffusion_model.transformer_blocks):
             patched.add_object_patch(
                 f"diffusion_model.transformer_blocks.{index}.forward",
-                types.MethodType(_mixed_block, block),
+                types.MethodType(block_forward, block),
             )
             patched.add_object_patch(
                 f"diffusion_model.transformer_blocks.{index}.attn.forward",
-                types.MethodType(_mixed_attention, block.attn),
+                types.MethodType(attention_forward, block.attn),
             )
 
         if validate_numerics:
@@ -208,11 +280,11 @@ class QwenV100MixedPrecision:
                         f"nan={nan_count}, inf={inf_count}, finite_max_abs={max_abs:.6g}"
                     )
             patched.model_options.setdefault("transformer_options", {})["qwen_v100_checker"] = checker
-            def validator(block, text, image):
+            def validator(block, *tensors):
                 index = block_ids[id(block)]
-                nan_count = int(torch.isnan(text).sum().item() + torch.isnan(image).sum().item())
-                inf_count = int(torch.isinf(text).sum().item() + torch.isinf(image).sum().item())
-                max_abs = max(float(text.abs().max().item()), float(image.abs().max().item()))
+                nan_count = sum(int(torch.isnan(t).sum().item()) for t in tensors)
+                inf_count = sum(int(torch.isinf(t).sum().item()) for t in tensors)
+                max_abs = max(float(t.abs().max().item()) for t in tensors)
                 logging.info("[QwenV100Mixed] block=%d nan=%d inf=%d max_abs=%.6g", index, nan_count, inf_count, max_abs)
                 if nan_count or inf_count:
                     raise FloatingPointError(f"Qwen V100 mixed precision produced non-finite values at block {index}: nan={nan_count}, inf={inf_count}")
