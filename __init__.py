@@ -204,9 +204,7 @@ def _mixed_block21(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}
     begin = transformer_options.get("qwen_v100_begin")
     if begin is not None:
         begin(self)
-    x = x.float()
-    scale1, gate1, scale2, gate2 = [(prefix.float(), target.float()) for prefix, target in mod[:4]]
-    zero = mod[4].float()
+    scale1, gate1, scale2, gate2, zero = mod
     x = _gated_residual(x, self.attn(_modulated_norm(self.img_norm1, x, scale1, prefix_len, zero), pe, attn_fn, prefix_len, transformer_options), gate1, prefix_len)
     _check(transformer_options, "attention.residual", x)
     x = _gated_residual(x, _mixed_swiglu(self.img_mlp, _modulated_norm(self.img_norm2, x, scale2, prefix_len, zero), transformer_options), gate2, prefix_len)
@@ -218,9 +216,11 @@ def _mixed_block21(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}
     return x
 
 
+# 2.1 keeps an fp32 compute dtype so the residual and modulation are fp32 before the block loop
+# and blocks only update the residual in place, matching the per-block malloc graph
 MIXED_FORWARDS = {
-    "QwenImageTransformer2DModel": (_mixed_block, _mixed_attention),
-    "QwenImage21Transformer2DModel": (_mixed_block21, _mixed_attention21),
+    "QwenImageTransformer2DModel": (_mixed_block, _mixed_attention, torch.float16),
+    "QwenImage21Transformer2DModel": (_mixed_block21, _mixed_attention21, torch.float32),
 }
 
 
@@ -247,9 +247,9 @@ class QwenV100MixedPrecision:
         diffusion_model = patched.model.diffusion_model
         if diffusion_model.__class__.__name__ not in MIXED_FORWARDS:
             raise RuntimeError("Qwen V100 Mixed Precision only supports Qwen Image and Qwen Image 2.1 models")
-        block_forward, attention_forward = MIXED_FORWARDS[diffusion_model.__class__.__name__]
+        block_forward, attention_forward, compute_dtype = MIXED_FORWARDS[diffusion_model.__class__.__name__]
 
-        patched.set_model_compute_dtype(torch.float16)
+        patched.set_model_compute_dtype(compute_dtype)
         for index, block in enumerate(diffusion_model.transformer_blocks):
             patched.add_object_patch(
                 f"diffusion_model.transformer_blocks.{index}.forward",

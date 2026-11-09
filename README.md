@@ -26,15 +26,15 @@ The first run was excluded as warmup. The custom node and workflow were unchange
 
 ## Benchmark: Tesla V100 32GB + Qwen Image 2.1
 
-Full-size Qwen Image 2.1 transformer with random weights, 1024x1024, one denoising step:
+Qwen Image 2.1 edit workflow, 25 steps, 896x1184, warm runs, same seed:
 
-| Compute | Step time | Error vs FP32 |
+| Compute | Prompt time | PSNR vs FP32 |
 | --- | ---: | ---: |
-| FP32 (ComfyUI default on V100) | 5468 ms | — |
-| Pure FP16 | 1170 ms | 0.57% |
-| V100 Mixed Precision | **1874 ms** | **0.35%** |
+| FP32 (ComfyUI default on V100) | 168.2 s | — |
+| Pure FP16 | **37.2 s** | 61.3 dB |
+| V100 Mixed Precision | 71.8 s | **65.7 dB** |
 
-**Result: 2.9x faster than the FP32 default.** When the residual stream exceeds the FP16 range, pure FP16 output breaks (141% error in a forced-overflow test) while the mixed path stays at 0.19%. Not yet measured with real 2.1 weights.
+In this workflow pure FP16 did not overflow and was 1.9x faster than the mixed path. For Qwen Image 2.1, try pure FP16 first and use this node only if FP16 produces NaN/Inf or black output. It is still 2.3x faster than FP32.
 
 ## Who is this for?
 
